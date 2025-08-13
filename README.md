@@ -7,4 +7,7 @@ formatting in that file looks like:
 
 GEMINI_API_KEY="abc123"
 
+Currently prompt just yells back that following phrase. The standard layout for the AI agent is commented out per last assignment. 
+
 will update for further information once this project is completed or another EOD update. 
+
