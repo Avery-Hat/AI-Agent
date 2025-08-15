@@ -102,36 +102,78 @@ def main():
         print(f"User prompt: {prompt}")
 
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+    # Start the conversation with the user’s message
     messages = [types.Content(role="user", parts=[types.Part(text=prompt)])]
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-001",
-        contents=messages,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            tools=[available_functions],
-        ),
-    )
+    # Agent loop: up to 20 steps
+        # Agent loop: up to 20 steps
+    for _ in range(20):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-001",
+                contents=messages,  # always send the full conversation
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=[available_functions],
+                ),
+            )
+        except Exception as e:
+            print(f"Error during generation: {e}")
+            sys.exit(1)
 
-    if verbose and getattr(response, "usage_metadata", None):
-        print("Prompt tokens:", response.usage_metadata.prompt_token_count)
-        print("Response tokens:", response.usage_metadata.candidates_token_count)
+        if verbose and getattr(response, "usage_metadata", None):
+            print("Prompt tokens:", response.usage_metadata.prompt_token_count)
+            print("Response tokens:", response.usage_metadata.candidates_token_count)
 
-    if getattr(response, "function_calls", None):
-        for fc in response.function_calls:
-            function_call_result = call_function(fc, verbose=verbose)
+        # Safety: no candidates -> nothing we can do
+        if not getattr(response, "candidates", None):
+            print("No output produced.")
+            break
 
-            # Validate expected payload shape
-            try:
-                payload = function_call_result.parts[0].function_response.response
-            except Exception:
-                raise RuntimeError("Fatal: tool call did not return a function_response payload")
+        # Add ALL candidate contents to the transcript first
+        # (This records the model's tool plan/function-call intents)
+        had_function_call = False
+        for cand in response.candidates:
+            content = cand.content
+            if content is None:
+                continue
 
-            if verbose:
-                print(f"-> {payload}")
+            # 1) Append the model's content (including function_call parts) to messages
+            messages.append(content)
+
+            # 2) Scan this content's parts for function calls
+            for part in getattr(content, "parts", []) or []:
+                fc = getattr(part, "function_call", None)
+                if not fc:
+                    continue
+                had_function_call = True
+
+                # Execute the tool call and append the tool response as a 'tool' message
+                tool_msg = call_function(fc, verbose=verbose)
+                # tool_msg is a types.Content(role="tool", parts=[from_function_response(...)]
+                messages.append(tool_msg)
+
+        # If the turn had *no* function calls, we consider it a final answer turn.
+        if not had_function_call:
+            # Prefer response.text, else join any text parts from the first candidate
+            final_text = response.text
+            if not final_text:
+                first = response.candidates[0].content
+                if first and getattr(first, "parts", None):
+                    final_text = "\n".join(
+                        p.text for p in first.parts if getattr(p, "text", None)
+                    )
+            if final_text:
+                print("Final response:")
+                print(final_text)
+            else:
+                print("No output produced.")
+            break
     else:
-        print("Response:")
-        print(response.text)
+        print("Reached iteration limit without a final response.")
+
+
 
 
 if __name__ == "__main__":
