@@ -5,75 +5,75 @@ from dotenv import load_dotenv
 from google.genai import types
 from prompts import system_prompt
 
-# If you already defined schemas in their own files, import them instead of redefining here:
-from functions.get_files_info import schema_get_files_info
+# Import the shared tool registry (schemas) from functions/schemas.py
+from functions.schemas import available_functions
 
-# --- New schemas (define here if you don't have separate schema variables) ---
-schema_get_file_content = types.FunctionDeclaration(
-    name="get_file_content",
-    description="Reads and returns the contents of a file, constrained to the working directory.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "file_path": types.Schema(
-                type=types.Type.STRING,
-                description="Path to the file, relative to the working directory.",
-            ),
-        },
-        required=["file_path"],
-    ),
-)
+# Import real tool implementations
+from functions.get_files_info import get_files_info
+from functions.get_file_content import get_file_content
+from functions.write_file import write_file
+from functions.run_python import run_python_file
 
-schema_run_python_file = types.FunctionDeclaration(
-    name="run_python_file",
-    description="Executes a Python file with optional arguments, constrained to the working directory.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "file_path": types.Schema(
-                type=types.Type.STRING,
-                description="Python file to execute, relative to the working directory.",
-            ),
-            "args": types.Schema(
-                type=types.Type.ARRAY,
-                items=types.Schema(type=types.Type.STRING),
-                description="Optional list of arguments to pass to the Python file.",
-            ),
-        },
-        required=["file_path"],
-    ),
-)
 
-schema_write_file = types.FunctionDeclaration(
-    name="write_file",
-    description="Writes or overwrites content to a file, constrained to the working directory.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "file_path": types.Schema(
-                type=types.Type.STRING,
-                description="Destination file path, relative to the working directory.",
-            ),
-            "content": types.Schema(
-                type=types.Type.STRING,
-                description="Text content to write.",
-            ),
-        },
-        required=["file_path", "content"],
-    ),
-)
-# ---------------------------------------------------------------------------
+def call_function(function_call_part, verbose: bool = False) -> types.Content:
+    """
+    Execute a tool call based on the model's FunctionCall.
+    Returns a types.Content with a function_response Part whose payload is accessed at:
+      content.parts[0].function_response.response  -> {"result": "..."} or {"error": "..."}
+    """
+    function_name = function_call_part.name
+    args = dict(function_call_part.args or {})
 
-# --- Single, top-level tool registry (what the grader expects) ---
-available_functions = types.Tool(
-    function_declarations=[
-        schema_get_files_info,
-        schema_get_file_content,
-        schema_run_python_file,
-        schema_write_file,
-    ]
-)
-# ----------------------------------------------------------------
+    if verbose:
+        print(f"Calling function: {function_name}({args})")
+    else:
+        print(f" - Calling function: {function_name}")
+
+    # Map function name -> actual Python function
+    registry = {
+        "get_files_info": get_files_info,
+        "get_file_content": get_file_content,
+        "run_python_file": run_python_file,
+        "write_file": write_file,
+    }
+
+    func = registry.get(function_name)
+    if func is None:
+        return types.Content(
+            role="tool",
+            parts=[
+                types.Part.from_function_response(
+                    name=function_name,
+                    response={"error": f"Unknown function: {function_name}"},
+                )
+            ],
+        )
+
+    # Inject working directory so the LLM never controls it
+    args["working_directory"] = "./calculator"
+
+    try:
+        result_str = func(**args)  # pass kwargs into the function
+        return types.Content(
+            role="tool",
+            parts=[
+                types.Part.from_function_response(
+                    name=function_name,
+                    response={"result": result_str},
+                )
+            ],
+        )
+    except Exception as e:
+        return types.Content(
+            role="tool",
+            parts=[
+                types.Part.from_function_response(
+                    name=function_name,
+                    response={"error": f"Execution failed: {e}"},
+                )
+            ],
+        )
+
 
 def main():
     load_dotenv()
@@ -108,7 +108,7 @@ def main():
         model="gemini-2.0-flash-001",
         contents=messages,
         config=types.GenerateContentConfig(
-            system_instruction=system_prompt,   # make sure prompts.py lists all 4 ops
+            system_instruction=system_prompt,
             tools=[available_functions],
         ),
     )
@@ -117,14 +117,22 @@ def main():
         print("Prompt tokens:", response.usage_metadata.prompt_token_count)
         print("Response tokens:", response.usage_metadata.candidates_token_count)
 
-    # Print function calls if present; otherwise print text
     if getattr(response, "function_calls", None):
         for fc in response.function_calls:
-            # fc.args prints like {'file_path': 'main.py'} / {'directory': 'pkg'}
-            print(f"Calling function: {fc.name}({fc.args})")
+            function_call_result = call_function(fc, verbose=verbose)
+
+            # Validate expected payload shape
+            try:
+                payload = function_call_result.parts[0].function_response.response
+            except Exception:
+                raise RuntimeError("Fatal: tool call did not return a function_response payload")
+
+            if verbose:
+                print(f"-> {payload}")
     else:
         print("Response:")
         print(response.text)
+
 
 if __name__ == "__main__":
     main()
